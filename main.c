@@ -38,7 +38,7 @@ int main(int argc, char *argv[]) {
         size = strtoull(argv[3], NULL, 10);
         const char *data_hex = argv[4];
         if (strlen(data_hex) != size * 2) {
-            fprintf(stderr, "错误: 十六进制数据字符串的长度应为指定大小的两倍 (每个字节2个字符)\\n");
+            fprintf(stderr, "错误: 十六进制数据字符串的长度应为指定大小的两倍 (每个字节2个字符)\n");
             return 1;
         }
         return do_write(addr, size, data_hex);
@@ -52,9 +52,9 @@ int main(int argc, char *argv[]) {
 }
 
 void print_usage(const char *prog_name) {
-    fprintf(stderr, "用法:\\n");
-    fprintf(stderr, "  %s read <物理地址(hex)> <长度(byte)> <输出文件名>\\n", prog_name);
-    fprintf(stderr, "  %s write <物理地址(hex)> <长度(byte)> <十六进制数据>\\n", prog_name);
+    fprintf(stderr, "用法:\n");
+    fprintf(stderr, "  %s read <物理地址(hex)> <长度(byte)> <输出文件名>\n", prog_name);
+    fprintf(stderr, "  %s write <物理地址(hex)> <长度(byte)> <十六进制数据>\n", prog_name);
 }
 
 int do_read(unsigned long long addr, unsigned long long size, const char *output_file) {
@@ -65,23 +65,36 @@ int do_read(unsigned long long addr, unsigned long long size, const char *output
         return 1;
     }
 
-    char *buffer = (char *)malloc(size);
-    if (!buffer) {
-        fprintf(stderr, "分配内存失败\\n");
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size < 0) {
+        perror("sysconf(_SC_PAGESIZE) 失败");
         close(fd);
         return 1;
     }
 
-    // 使用 lseek 设定要读取的物理内存地址
-    if (lseek(fd, addr, SEEK_SET) == (off_t)-1) {
+    // 计算页面对齐的地址和大小
+    unsigned long long start_offset = addr % page_size;
+    unsigned long long aligned_start_addr = addr - start_offset;
+    unsigned long long total_bytes_needed = size + start_offset;
+    unsigned long long aligned_read_size = ((total_bytes_needed + page_size - 1) / page_size) * page_size;
+
+    char *buffer = NULL;
+    if (posix_memalign((void **)&buffer, page_size, aligned_read_size) != 0) {
+        fprintf(stderr, "分配页面对齐内存失败\n");
+        close(fd);
+        return 1;
+    }
+
+    // 使用 lseek 设定对齐后的物理内存地址
+    if (lseek(fd, aligned_start_addr, SEEK_SET) == (off_t)-1) {
         perror("lseek 失败");
         free(buffer);
         close(fd);
         return 1;
     }
     
-    // 从设定的地址读取数据
-    ssize_t bytes_read = read(fd, buffer, size);
+    // 从设定的地址读取对齐后的数据块
+    ssize_t bytes_read = read(fd, buffer, aligned_read_size);
     if (bytes_read < 0) {
         perror("从设备读取失败");
         free(buffer);
@@ -89,8 +102,8 @@ int do_read(unsigned long long addr, unsigned long long size, const char *output
         return 1;
     }
     
-    if ((unsigned long long)bytes_read != size) {
-        fprintf(stderr, "警告: 读取的字节数 (%zd) 与请求的大小 (%llu) 不匹配\\n", bytes_read, size);
+    if ((unsigned long long)bytes_read != aligned_read_size) {
+        fprintf(stderr, "警告: 读取的字节数 (%zd) 与请求的对齐大小 (%llu) 不匹配\n", bytes_read, aligned_read_size);
     }
 
     FILE *out_fp = fopen(output_file, "wb");
@@ -101,10 +114,11 @@ int do_read(unsigned long long addr, unsigned long long size, const char *output
         return 1;
     }
 
-    fwrite(buffer, 1, bytes_read, out_fp);
+    // 从对齐的缓冲区中写入实际请求的数据
+    fwrite(buffer + start_offset, 1, size, out_fp);
     fclose(out_fp);
 
-    printf("成功从地址 0x%llx 读取 %zd 字节到文件 '%s'\\n", addr, bytes_read, output_file);
+    printf("成功从地址 0x%llx 读取 %llu 字节到文件 '%s' (对齐读取 %llu 字节)\n", addr, size, output_file, aligned_read_size);
 
     free(buffer);
     close(fd);
@@ -120,57 +134,91 @@ int hex_char_to_int(char c) {
 }
 
 int do_write(unsigned long long addr, unsigned long long size, const char *data_hex) {
-    const char *dev_name = "/dev/xdma0_h2c_0"; // H2C for Host-to-Card (write)
-    int fd = open(dev_name, O_WRONLY);
-    if (fd < 0) {
-        perror("打开写入设备(/dev/xdma0_h2c_0)失败");
+    const char *read_dev_name = "/dev/xdma0_c2h_0";
+    const char *write_dev_name = "/dev/xdma0_h2c_0";
+    int read_fd = -1, write_fd = -1;
+    char *buffer = NULL;
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size < 0) {
+        perror("sysconf(_SC_PAGESIZE) 失败");
         return 1;
     }
 
-    char *buffer = (char *)malloc(size);
-    if (!buffer) {
-        fprintf(stderr, "分配内存失败\\n");
-        close(fd);
+    // 计算页面对齐的地址和大小
+    unsigned long long start_offset = addr % page_size;
+    unsigned long long aligned_start_addr = addr - start_offset;
+    unsigned long long total_bytes_needed = size + start_offset;
+    unsigned long long aligned_rw_size = ((total_bytes_needed + page_size - 1) / page_size) * page_size;
+
+    if (posix_memalign((void **)&buffer, page_size, aligned_rw_size) != 0) {
+        fprintf(stderr, "分配页面对齐内存失败\n");
         return 1;
     }
-    
-    // 将十六进制字符串转换为字节数组
+
+    // 读-改-写 (Read-Modify-Write)
+    // 1. 读取整个对齐的块
+    read_fd = open(read_dev_name, O_RDONLY);
+    if (read_fd < 0) {
+        perror("打开读取设备(/dev/xdma0_c2h_0)进行 RMW 操作失败");
+        free(buffer);
+        return 1;
+    }
+    if (lseek(read_fd, aligned_start_addr, SEEK_SET) == (off_t)-1) {
+        perror("lseek 读取设备失败");
+        free(buffer);
+        close(read_fd);
+        return 1;
+    }
+    ssize_t bytes_read = read(read_fd, buffer, aligned_rw_size);
+    if (bytes_read < 0 || (unsigned long long)bytes_read != aligned_rw_size) {
+        fprintf(stderr, "RMW 期间读取原始数据失败 (读取 %zd / %llu 字节)\n", bytes_read, aligned_rw_size);
+        perror("读取错误");
+        free(buffer);
+        close(read_fd);
+        return 1;
+    }
+    close(read_fd);
+
+    // 2. 在内存中修改需要写入的部分
     for (unsigned long long i = 0; i < size; ++i) {
         int high = hex_char_to_int(data_hex[i * 2]);
         int low = hex_char_to_int(data_hex[i * 2 + 1]);
         if (high == -1 || low == -1) {
-            fprintf(stderr, "错误: 无效的十六进制字符\\n");
+            fprintf(stderr, "错误: 无效的十六进制字符\n");
             free(buffer);
-            close(fd);
             return 1;
         }
-        buffer[i] = (high << 4) | low;
-    }
-
-    // 使用 lseek 设定要写入的物理内存地址
-    if (lseek(fd, addr, SEEK_SET) == (off_t)-1) {
-        perror("lseek 失败");
-        free(buffer);
-        close(fd);
-        return 1;
+        buffer[start_offset + i] = (high << 4) | low;
     }
     
-    // 向设定的地址写入数据
-    ssize_t bytes_written = write(fd, buffer, size);
-     if (bytes_written < 0) {
-        perror("写入设备失败");
+    // 3. 将修改后的整个块写回
+    write_fd = open(write_dev_name, O_WRONLY);
+    if (write_fd < 0) {
+        perror("打开写入设备(/dev/xdma0_h2c_0)失败");
         free(buffer);
-        close(fd);
         return 1;
     }
-
-    if ((unsigned long long)bytes_written != size) {
-        fprintf(stderr, "警告: 写入的字节数 (%zd) 与请求的大小 (%llu) 不匹配\\n", bytes_written, size);
+    if (lseek(write_fd, aligned_start_addr, SEEK_SET) == (off_t)-1) {
+        perror("lseek 写入设备失败");
+        free(buffer);
+        close(write_fd);
+        return 1;
+    }
+    ssize_t bytes_written = write(write_fd, buffer, aligned_rw_size);
+    if (bytes_written < 0) {
+        perror("写入设备失败");
+        free(buffer);
+        close(write_fd);
+        return 1;
+    }
+    if ((unsigned long long)bytes_written != aligned_rw_size) {
+        fprintf(stderr, "警告: 写入的字节数 (%zd) 与对齐后的大小 (%llu) 不匹配\n", bytes_written, aligned_rw_size);
     }
 
-    printf("成功向地址 0x%llx 写入 %zd 字节\\n", addr, bytes_written);
+    printf("成功向地址 0x%llx 写入 %llu 字节 (页面对齐写入 %llu 字节)\n", addr, size, aligned_rw_size);
 
     free(buffer);
-    close(fd);
+    close(write_fd);
     return 0;
 } 
